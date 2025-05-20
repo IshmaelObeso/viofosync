@@ -621,7 +621,7 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
             logger.info("Detected %d new/updated files", len(to_download))
             for rec in to_download:
                 grp = get_group_name(rec.datetime, grouping)
-                downloaded, _ = download_file(base_url, rec, destination, grp)
+                downloaded, _ = download_file(base_url, rec, destination, grp, args.timeout, args.dry-run)
                 if downloaded and args.gps_extract:
                     extract_gps_data(os.path.join(destination, grp or "", rec.filename))
         else:
