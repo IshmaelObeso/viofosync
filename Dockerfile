@@ -8,7 +8,6 @@ RUN apk add --update bash python3 shadow tzdata \
 COPY COPYING /
 COPY setuid.sh /setuid.sh
 COPY entrypoint.sh /entrypoint.sh
-COPY crontab /var/spool/cron/crontabs/dashcam
 
 ENV ADDRESS="" \
     PUID="" \

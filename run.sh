@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
+set -eux
 
-docker run -it --rm \
-    -e ADDRESS=127.0.0.2 \
-    -v $(pwd)/tmp:/recordings \
-    -e DRY_RUN=1 \
-    -e CRON=0 \
-    -e RUN_ONCE=1 \
-    -e VERBOSE=1 \
-    --name viofosync \
-acolomba/viofosync
+docker run --rm -it \
+  --name viofosync \
+  -e ADDRESS=127.0.0.2 \
+  -e PUID="$(id -u)" \
+  -e PGID="$(id -g)" \
+  -e VERBOSE=1 \
+  -e DRY_RUN=1 \
+  -e RUN_ONCE=1 \
+  -v "$(pwd)/tmp":/recordings:rw \
+  robxyz/viofosync:latest

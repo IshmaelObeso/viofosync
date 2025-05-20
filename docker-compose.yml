@@ -50,13 +50,12 @@ services:
       # logged.
       QUIET: ''
 
-      # Makes it so downloads of normal recordings and unexpected error
-      # conditions are logged. Can be set to '' to disable.
-      CRON: ''
-
       # Set to any value to enable GPS data extraction and GPX file creation.
       GPS_EXTRACT: ''
 
       # If set to any value, makes it so that the script communicates what it
       # would do without actually doing anything.
       DRY_RUN: ''
+
+      # RUN_ONCE:
+      #   "1"    # if you ever want just a one-shot sync, uncomment this

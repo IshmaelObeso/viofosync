@@ -1,33 +1,49 @@
 #!/usr/bin/env bash
+set -eu
 
-# keep option set if KEEP set
-keep=${KEEP:+--keep $KEEP}
+# Build up the common flags
+flags=()
 
-# grouping option if GROUPING set
-grouping=${GROUPING:+--grouping $GROUPING}
+# keep
+[ -n "${KEEP:-}" ] && flags+=( --keep "$KEEP" )
 
-# download priority option set if PRIORITY set
-priority=${PRIORITY:+--priority $PRIORITY}
+# grouping
+[ -n "${GROUPING:-}" ] && flags+=( --grouping "$GROUPING" )
 
-# disk usage option set if USAGE set
-disk_usage=${MAX_USED_DISK:+--max-used-disk $MAX_USED_DISK}
+# priority
+[ -n "${PRIORITY:-}" ] && flags+=( --priority "$PRIORITY" )
 
-# timeout set if TIMEOUT set
-timeout=${TIMEOUT:+--timeout $TIMEOUT}
+# max disk usage
+[ -n "${MAX_USED_DISK:-}" ] && flags+=( --max-used-disk "$MAX_USED_DISK" )
 
-# as many verbose options as the value in VERBOSE
-verbose=${VERBOSE:+$(if [[ $VERBOSE -gt 0 ]]; then for i in $(seq 1 $VERBOSE); do echo --verbose; done; fi)}
+# timeout
+[ -n "${TIMEOUT:-}" ] && flags+=( --timeout "$TIMEOUT" )
 
-# dry-run option if DRY_RUN set to anything
-quiet="${QUIET:+--quiet}"
+# verbosity
+if [ "${VERBOSE:-0}" -gt 0 ]; then
+  for i in $(seq 1 "$VERBOSE"); do
+    flags+=( --verbose )
+  done
+fi
 
-# cron option if CRON set to anything
-cron="${CRON:+--cron}"
+# quiet
+[ -n "${QUIET:-}" ] && flags+=( --quiet )
 
-# dry-run option if DRY_RUN set to anything
-dry_run="${DRY_RUN:+--dry-run}"
+# dry-run
+[ -n "${DRY_RUN:-}" ] && flags+=( --dry-run )
 
-gps_extract="${GPS_EXTRACT:+--gps-extract}"
+# gps extract
+[ -n "${GPS_EXTRACT:-}" ] && flags+=( --gps-extract )
 
-/viofosync.py ${ADDRESS} --destination /recordings ${keep} ${grouping} ${priority} ${disk_usage} ${timeout} ${verbose} ${gps_extract} \
-    ${quiet} ${cron} ${dry_run}
+# run-once vs monitor
+if [ -n "${RUN_ONCE:-}" ]; then
+  flags+=( --run-once )
+else
+  flags+=( --monitor )
+fi
+
+# finally exec the Python script
+exec python3 /viofosync.py \
+     "$ADDRESS" \
+     --destination /recordings \
+     "${flags[@]}"
