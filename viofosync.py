@@ -447,7 +447,7 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
             recs = get_dashcam_filenames(base_url)
         except Exception as e:
             logger.warning(f"Failed to list files; retry in 30s: {e}")
-            time.sleep(30)
+            time.sleep(600)
             continue
 
         to_dl = []
@@ -478,7 +478,7 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
         else:
             logger.debug("All files up to date")
 
-        time.sleep(30)
+        time.sleep(600)
 
 
 def run():
