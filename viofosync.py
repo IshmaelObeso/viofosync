@@ -70,19 +70,22 @@ downloaded_filename_re = re.compile(
 
 Recording = namedtuple("Recording", "filename filepath size timecode datetime attr")
 
+
 def to_downloaded_recording(filename, grouping):
     match = downloaded_filename_re.match(filename)
     if not match:
         return None
-    components = {k: int(v) for k, v in match.groupdict().items() if k in ("year","month","day","hour","minute","second")}
+    gd = match.groupdict()
     dt = datetime.datetime(
-        components["year"], components["month"], components["day"],
-        components["hour"], components["minute"], components["second"]
+        int(gd["year"]), int(gd["month"]), int(gd["day"]),
+        int(gd["hour"]), int(gd["minute"]), int(gd["second"])
     )
     return Recording(filename, None, None, None, dt, None)
 
+
 def parse_viofo_datetime(time_str):
     return datetime.datetime.strptime(time_str, "%Y/%m/%d %H:%M:%S")
+
 
 def get_dashcam_filenames(base_url):
     url = f"{base_url}/?custom=1&cmd=3015&par=1"
@@ -108,14 +111,17 @@ def get_dashcam_filenames(base_url):
     logger.info(f"Found {len(recordings)} recordings on dashcam")
     return recordings
 
+
 def get_filepath(destination, group_name, filename):
     return os.path.join(destination, group_name, filename) if group_name else os.path.join(destination, filename)
+
 
 def get_remote_size(url, timeout):
     req = urllib.request.Request(url, method="HEAD")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         cl = resp.getheader("Content-Length")
     return int(cl) if cl and cl.isdigit() else None
+
 
 def ensure_destination(path):
     if not os.path.exists(path):
@@ -124,6 +130,34 @@ def ensure_destination(path):
         raise RuntimeError(f"Not a directory: {path}")
     elif not os.access(path, os.W_OK):
         raise RuntimeError(f"Not writable: {path}")
+
+
+def human_size_and_speed(num_bytes: int, elapsed: float):
+    """
+    Returns (size_str, speed_str), e.g. ("325.1 MB", "27.1 MB/s").
+    Chooses KB, MB, or GB based on magnitude.
+    """
+    thresholds = [
+        (1 << 30, "GB"),
+        (1 << 20, "MB"),
+        (1 << 10, "KB"),
+        (1,       "B"),
+    ]
+    # size
+    for factor, suffix in thresholds:
+        if num_bytes >= factor:
+            size = num_bytes / factor
+            break
+    size_str = f"{size:.1f} {suffix}"
+    # speed
+    bps = num_bytes / elapsed
+    for factor, suffix in thresholds:
+        if bps >= factor:
+            spd = bps / factor
+            break
+    speed_str = f"{spd:.1f} {suffix}/s"
+    return size_str, speed_str
+
 
 def download_file(base_url, recording, destination, group_name, socket_timeout, dry_run):
     cleaned = recording.filepath.replace('A:', '').replace('\\', '/')
@@ -142,7 +176,8 @@ def download_file(base_url, recording, destination, group_name, socket_timeout, 
     # 2) Skip if already complete
     if expected_size is not None and os.path.exists(final_path):
         if os.path.getsize(final_path) == expected_size:
-            logger.debug(f"Skipping complete file: {recording.filename}")
+            size_str, _ = human_size_and_speed(os.path.getsize(final_path), 1)
+            logger.debug(f"Skipping complete file: {recording.filename} ({size_str})")
             return False, None
 
     if dry_run:
@@ -155,29 +190,39 @@ def download_file(base_url, recording, destination, group_name, socket_timeout, 
     for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
         try:
             logger.info(f"Downloading {recording.filename} (attempt {attempt})")
+            start = time.perf_counter()
             with urllib.request.urlopen(url, timeout=socket_timeout) as resp, open(tmp_path, "wb") as out:
                 shutil.copyfileobj(resp, out)
+            elapsed = time.perf_counter() - start
         except Exception as e:
             logger.warning(f"Attempt {attempt} failed: {e}")
             time.sleep(RETRY_BACKOFF * attempt)
         else:
             actual_size = os.path.getsize(tmp_path)
             if expected_size is not None and actual_size != expected_size:
+                actual_str, _   = human_size_and_speed(actual_size, 1)
+                expected_str, _ = human_size_and_speed(expected_size, 1)
                 logger.error(
-                    f"Incomplete download: {recording.filename} {actual_size}/{expected_size} bytes"
+                    f"Incomplete download of {recording.filename}: "
+                    f"{actual_str}/{expected_str}"
                 )
                 os.remove(tmp_path)
                 time.sleep(RETRY_BACKOFF * attempt)
             else:
+                size_str, speed_str = human_size_and_speed(actual_size, elapsed)
                 os.replace(tmp_path, final_path)
-                logger.info(f"Downloaded {recording.filename} ({actual_size} bytes)")
+                logger.info(
+                    f"Downloaded {recording.filename}: "
+                    f"{size_str} in {elapsed:.1f}s ({speed_str})"
+                )
                 return True, None
 
     # all attempts failed
     if os.path.exists(tmp_path):
         os.remove(tmp_path)
-    logger.error(f"Failed to download {recording.filename}")
+    logger.error(f"Failed to download {recording.filename} after {MAX_DOWNLOAD_ATTEMPTS} attempts")
     return False, None
+
 
 def get_downloaded_recordings(destination, grouping):
     glob_pattern = get_filepath(destination, group_name_globs[grouping], downloaded_filename_glob)
@@ -187,15 +232,17 @@ def get_downloaded_recordings(destination, grouping):
         fn = os.path.basename(fp)
         m = downloaded_filename_re.match(fn)
         if m:
-            date = datetime.date(int(m.group("year")), int(m.group("month")), int(m.group("day")))
-            recs.add((fn, date))
+            dt = datetime.date(int(m.group("year")), int(m.group("month")), int(m.group("day")))
+            recs.add((fn, dt))
     return recs
+
 
 def get_outdated_recordings(destination, grouping):
     if cutoff_date is None:
         return []
     downloaded = get_downloaded_recordings(destination, grouping)
     return [fn for fn, dt in downloaded if dt < cutoff_date]
+
 
 def prepare_destination(destination, grouping):
     if cutoff_date:
@@ -205,13 +252,13 @@ def prepare_destination(destination, grouping):
                 continue
             gp = group_name_globs[grouping]
             pattern = f"{os.path.splitext(fn)[0]}.*"
-            to_remove = glob.glob(get_filepath(destination, gp, pattern))
-            for p in to_remove:
+            for p in glob.glob(get_filepath(destination, gp, pattern)):
                 try:
                     os.remove(p)
                     logger.info(f"Removed old file {p}")
                 except OSError as e:
                     logger.error(f"Error removing {p}: {e}")
+
 
 def sync(address, destination, grouping, download_priority, recording_filter, args):
     logger.info(f"Starting sync for {address}")
@@ -224,7 +271,7 @@ def sync(address, destination, grouping, download_priority, recording_filter, ar
         logger.error(f"Aborting sync: {e}")
         return False
 
-    recs.sort(key=lambda r: r.datetime, reverse=(download_priority=="rdate"))
+    recs.sort(key=lambda r: r.datetime, reverse=(download_priority == "rdate"))
     if recording_filter:
         recs = [r for r in recs if any(f in r.filename for f in recording_filter)]
         logger.info(f"After filter: {len(recs)} recordings")
@@ -241,95 +288,123 @@ def sync(address, destination, grouping, download_priority, recording_filter, ar
     logger.info("Sync complete")
     return True
 
+
 def get_group_name(dt, grouping):
-    if grouping=="daily":
+    if grouping == "daily":
         return dt.strftime("%Y-%m-%d")
-    if grouping=="weekly":
+    if grouping == "weekly":
         start = dt - datetime.timedelta(days=dt.weekday())
         return start.strftime("%Y-%m-%d")
-    if grouping=="monthly":
+    if grouping == "monthly":
         return dt.strftime("%Y-%m")
-    if grouping=="yearly":
+    if grouping == "yearly":
         return dt.strftime("%Y")
     return None
 
-# (GPX & GPS extraction functions remain unchanged)...
+
+# GPS extraction helpers (unchanged)...
 def fix_time(hour, minute, second, year, month, day):
     return f"{year+2000:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}Z"
+
 
 def fix_coordinates(hemi, coord):
     mins = coord % 100.0
     deg = coord - mins
-    val = deg/100.0 + mins/60.0
-    return -val if hemi in ['S','W'] else val
+    val = deg / 100.0 + mins / 60.0
+    return -val if hemi in ['S', 'W'] else val
+
 
 def fix_speed(s): return s * 0.514444
 
+
 def get_atom_info(b): return struct.unpack('>I4s', b)
+
 
 def get_gps_atom_info(b):
     pos, size = struct.unpack('>II', b)
     return pos, size
 
+
 def get_gps_data(data):
-    gps = {'DT':{}, 'Loc':{}}
+    gps = {'DT': {}, 'Loc': {}}
     off = 0
     hour, minute, second, year, month, day = struct.unpack_from('<IIIIII', data, off)
     off += 24
     act, lat_h, lon_h = struct.unpack_from('<ccc', data, off)
     off += 4
     lat_r, lon_r, sp, bc = struct.unpack_from('<ffff', data, off)
-    gps['DT'] = {'Hour':hour,'Minute':minute,'Second':second,'Year':year,'Month':month,'Day':day,
-                 'DT':fix_time(hour,minute,second,year,month,day)}
+    gps['DT'] = {
+        'Hour': hour, 'Minute': minute, 'Second': second,
+        'Year': year, 'Month': month, 'Day': day,
+        'DT': fix_time(hour, minute, second, year, month, day)
+    }
     gps['Loc'] = {
-        'Lat':{'Raw':lat_r,'Hemi':lat_h.decode(),'Float':fix_coordinates(lat_h.decode(),lat_r)},
-        'Lon':{'Raw':lon_r,'Hemi':lon_h.decode(),'Float':fix_coordinates(lon_h.decode(),lon_r)},
-        'Speed':fix_speed(sp),'Bearing':bc
+        'Lat': {
+            'Raw': lat_r, 'Hemi': lat_h.decode(),
+            'Float': fix_coordinates(lat_h.decode(), lat_r)
+        },
+        'Lon': {
+            'Raw': lon_r, 'Hemi': lon_h.decode(),
+            'Float': fix_coordinates(lon_h.decode(), lon_r)
+        },
+        'Speed': fix_speed(sp),
+        'Bearing': bc
     }
     return gps
+
 
 def get_gps_atom(gps_info, fh):
     pos, size = gps_info
     fh.seek(pos)
     data = fh.read(size)
     s1, t, m = struct.unpack_from('>I4s4s', data)
-    if t.decode()!='free' or m.decode()!='GPS ' or s1!=size:
+    if t.decode() != 'free' or m.decode() != 'GPS ' or s1 != size:
         return None
     return get_gps_data(data[12:])
 
+
 def parse_moov(fh):
-    data = []
+    out = []
     offset = 0
     while True:
         size, t = get_atom_info(fh.read(8))
-        if size==0: break
-        if t.decode()=='moov':
-            sub = offset+8
-            while sub < offset+size:
+        if size == 0:
+            break
+        if t.decode() == 'moov':
+            sub = offset + 8
+            while sub < offset + size:
                 s2, t2 = get_atom_info(fh.read(8))
-                if t2.decode()=='gps ':
-                    fh.seek(sub+16)
-                    while sub+16 < offset+size:
+                if t2.decode() == 'gps ':
+                    fh.seek(sub + 16)
+                    while sub + 16 < offset + size:
                         info = get_gps_atom_info(fh.read(8))
-                        res = get_gps_atom(info, fh)
-                        if res: data.append(res)
+                        data = get_gps_atom(info, fh)
+                        if data:
+                            out.append(data)
                         sub += 8
-                        fh.seek(sub+16)
+                        fh.seek(sub + 16)
                 sub += s2
                 fh.seek(sub)
         offset += size
         fh.seek(offset)
-    return data
+    return out
+
 
 def generate_gpx(gps_data, out_file):
     gpx = '<?xml version="1.0"?>\n<gpx version="1.0" creator="Viofo GPS Extractor">\n<trk><name>' \
           + out_file + '</name><trkseg>\n'
     for g in gps_data:
-        gpx += f'\t<trkpt lat="{g["Loc"]["Lat"]["Float"]}" lon="{g["Loc"]["Lon"]["Float"]}">' \
-               f'<time>{g["DT"]["DT"]}</time><speed>{g["Loc"]["Speed"]}</speed>' \
-               f'<course>{g["Loc"]["Bearing"]}</course></trkpt>\n'
+        gpx += (
+            f'\t<trkpt lat="{g["Loc"]["Lat"]["Float"]}" '
+            f'lon="{g["Loc"]["Lon"]["Float"]}">'
+            f'<time>{g["DT"]["DT"]}</time>'
+            f'<speed>{g["Loc"]["Speed"]}</speed>'
+            f'<course>{g["Loc"]["Bearing"]}</course>'
+            '</trkpt>\n'
+        )
     gpx += '</trkseg></trk>\n</gpx>\n'
     return gpx
+
 
 def extract_gps_data(fp):
     logger.info(f"Extracting GPS from {fp}")
@@ -343,24 +418,26 @@ def extract_gps_data(fp):
         out.write(gpx)
         logger.info(f"Wrote GPX to {fp}.gpx")
 
+
 def parse_args():
     p = argparse.ArgumentParser(description="Sync Viofo dashcam recordings")
     p.add_argument("address", help="Dashcam IP/hostname")
-    p.add_argument("-d","--destination", default=os.getcwd(), help="Download directory")
-    p.add_argument("-g","--grouping", choices=["none","daily","weekly","monthly","yearly"], default="none")
-    p.add_argument("-p","--priority", choices=["date","rdate"], default="date")
-    p.add_argument("-f","--filter", nargs="+", help="Filename substring filter")
-    p.add_argument("-k","--keep", help="Keep for <number>[d|w]")
-    p.add_argument("-u","--max-used-disk", type=int, choices=range(5,99), default=90, metavar="DISK%")
-    p.add_argument("-t","--timeout", type=float, default=10.0, help="Timeout seconds")
-    p.add_argument("-v","--verbose", action="count", default=0)
-    p.add_argument("-q","--quiet", action="store_true")
+    p.add_argument("-d", "--destination", default=os.getcwd(), help="Download directory")
+    p.add_argument("-g", "--grouping", choices=["none", "daily", "weekly", "monthly", "yearly"], default="none")
+    p.add_argument("-p", "--priority", choices=["date", "rdate"], default="date")
+    p.add_argument("-f", "--filter", nargs="+", help="Filename substring filter")
+    p.add_argument("-k", "--keep", help="Keep for <number>[d|w]")
+    p.add_argument("-u", "--max-used-disk", type=int, choices=range(5, 99), default=90, metavar="DISK%")
+    p.add_argument("-t", "--timeout", type=float, default=10.0, help="Timeout seconds")
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    p.add_argument("-q", "--quiet", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--gps-extract", action="store_true")
     p.add_argument("--run-once", action="store_true")
     p.add_argument("--monitor", action="store_true")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p.parse_args()
+
 
 def monitor_loop(address, destination, grouping, priority, recording_filter, args):
     logger.info("Entering monitor loop (Ctrl+C to exit)")
@@ -370,17 +447,18 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
             recs = get_dashcam_filenames(base_url)
         except Exception as e:
             logger.warning(f"Failed to list files; retry in 30s: {e}")
-            time.sleep(600)
+            time.sleep(30)
             continue
 
         to_dl = []
         for rec in recs:
-            cleaned = rec.filepath.replace('A:','').replace('\\','/')
+            cleaned = rec.filepath.replace('A:', '').replace('\\', '/')
             url = f"{base_url}/{cleaned}"
             try:
                 remote_size = get_remote_size(url, socket_timeout)
             except Exception:
                 continue
+
             grp = get_group_name(rec.datetime, grouping) or ""
             local_fp = os.path.join(destination, grp, rec.filename)
             local_size = os.path.getsize(local_fp) if os.path.exists(local_fp) else -1
@@ -400,7 +478,8 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
         else:
             logger.debug("All files up to date")
 
-        time.sleep(600)
+        time.sleep(30)
+
 
 def run():
     global dry_run, cutoff_date, socket_timeout
@@ -421,7 +500,8 @@ def run():
         if not m:
             raise RuntimeError("KEEP format <number>[d|w]")
         n, unit = int(m.group(1)), m.group(2) or "d"
-        delta = datetime.timedelta(days=n if unit=="d" else 0, weeks=n if unit=="w" else 0)
+        delta = datetime.timedelta(days=n if unit == "d" else 0,
+                                   weeks=n if unit == "w" else 0)
         cutoff_date = datetime.date.today() - delta
         logger.info(f"Cutoff date: {cutoff_date}")
 
@@ -433,6 +513,7 @@ def run():
     success = sync(args.address, args.destination,
                    args.grouping, args.priority, args.filter, args)
     return 0 if success else 1
+
 
 if __name__ == "__main__":
     exit(run())
