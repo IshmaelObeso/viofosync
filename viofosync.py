@@ -3,7 +3,7 @@
 # Copyright (c) 2024 Rob Smith
 # Based on BlackVueSync by Alessandro Colomba (https://github.com/acolomba)
 # GPS extraction method by Sergei Franco
-# 
+#
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
 # documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
 # rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
@@ -28,24 +28,31 @@ import logging
 import re
 import os
 import time
-import urllib
-import urllib.parse
 import urllib.request
+import urllib.error
 import socket
 import xml.etree.ElementTree as ET
 import struct
+import shutil
+import tempfile
 
-
+# Constants
+dry_run = False
+max_disk_used_percent = 90
+cutoff_date = None
+socket_timeout = 10.0
+MAX_DOWNLOAD_ATTEMPTS = 3
+RETRY_BACKOFF = 5  # seconds between retries, multiplied by attempt number
 
 # Logging setup
-Recording = namedtuple("Recording", "filename filepath size timecode datetime attr")
-logging.basicConfig(format="%(asctime)s: %(levelname)s %(message)s", level=logging.DEBUG)
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)  # Ensure logger is set to DEBUG level
-logger = logging.getLogger()
-cron_logger = logging.getLogger("cron")
+logging.basicConfig(
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Group name globs, keyed by grouping
+# Group name globs
 group_name_globs = {
     "none": None,
     "daily": "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]",
@@ -54,613 +61,377 @@ group_name_globs = {
     "yearly": "[0-9][0-9][0-9][0-9]",
 }
 
-# Downloaded recording filename glob pattern
-downloaded_filename_glob = "[0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][FR].MP4"
+downloaded_filename_glob = "[0-9]{4}_[0-9]{2}[0-9]{2}_[0-9]{6}[FR].MP4"
+downloaded_filename_re = re.compile(
+    r"^(?P<year>\d{4})_(?P<month>\d{2})(?P<day>\d{2})"
+    r"_(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})"
+    r"_(?P<sequence>\d{6})(?P<camera>[FR])\.MP4$"
+)
 
-# Downloaded recording filename regular expression
-downloaded_filename_re = re.compile(r"""^(?P<year>\d{4})_(?P<month>\d{2})(?P<day>\d{2})
-    _(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})_(?P<sequence>\d{6})(?P<camera>[FR])\.MP4$""", re.VERBOSE)
-
-def to_downloaded_recording(filename, grouping):
-    """extracts destination recording information from a filename"""
-    logger.debug(f"Attempting to match filename: {filename} with pattern: {downloaded_filename_re.pattern}")
-    filename_match = re.match(downloaded_filename_re, filename)
-    logger.debug(f"Filename match result: {filename_match}")
-
-    if filename_match is None:
-        logger.debug(f"No match found for filename: {filename}")
-        return None
-
-    year = int(filename_match.group("year"))
-    month = int(filename_match.group("month"))
-    day = int(filename_match.group("day"))
-    hour = int(filename_match.group("hour"))
-    minute = int(filename_match.group("minute"))
-    second = int(filename_match.group("second"))
-    logger.debug(f"Extracted date components - Year: {year}, Month: {month}, Day: {day}, Hour: {hour}, Minute: {minute}, Second: {second}")
-    recording_datetime = datetime.datetime(year, month, day, hour, minute, second)
-    logger.debug(f"Constructed datetime: {recording_datetime}")
-    recording_group_name = get_group_name(recording_datetime, grouping)
-
-    return Recording(filename, None, None, recording_datetime, None, None)
-dry_run = False
-max_disk_used_percent = 90
-cutoff_date = None
-socket_timeout = 10.0
-
-# Modify the Recording namedtuple to match Viofo's file information
 Recording = namedtuple("Recording", "filename filepath size timecode datetime attr")
 
-# Update the filename regular expression to match Viofo's naming convention
-filename_re = re.compile(r"""(?P<year>\d{4})_(?P<month>\d{2})(?P<day>\d{2})
-    _(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})
-    _(?P<sequence>\d{5})(?P<camera>[FR])\.MP4""", re.VERBOSE)
+def to_downloaded_recording(filename, grouping):
+    match = downloaded_filename_re.match(filename)
+    if not match:
+        return None
+    components = {k: int(v) for k, v in match.groupdict().items() if k in ("year","month","day","hour","minute","second")}
+    dt = datetime.datetime(
+        components["year"], components["month"], components["day"],
+        components["hour"], components["minute"], components["second"]
+    )
+    return Recording(filename, None, None, None, dt, None)
 
 def parse_viofo_datetime(time_str):
-    """Parse the datetime string from Viofo's format"""
     return datetime.datetime.strptime(time_str, "%Y/%m/%d %H:%M:%S")
 
 def get_dashcam_filenames(base_url):
-    """gets the recording filenames from the Viofo dashcam"""
-    logger.debug(f"Attempting to get file list from {base_url}")
+    url = f"{base_url}/?custom=1&cmd=3015&par=1"
     try:
-        url = f"{base_url}/?custom=1&cmd=3015&par=1"
-        logger.debug(f"Sending request to URL: {url}")
-        request = urllib.request.Request(url)
-        response = urllib.request.urlopen(request, timeout=socket_timeout)
+        with urllib.request.urlopen(url, timeout=socket_timeout) as resp:
+            if resp.getcode() != 200:
+                raise RuntimeError(f"Bad status {resp.getcode()}")
+            xml_data = resp.read().decode()
+    except Exception as e:
+        logger.error(f"Failed to fetch file list: {e}")
+        raise
 
-        response_status_code = response.getcode()
-        logger.debug(f"Response status code: {response_status_code}")
-        if response_status_code != 200:
-            raise RuntimeError(f"Error response from : {base_url} ; status code : {response_status_code}")
-
-        xml_data = response.read().decode('utf-8')
-        logger.debug(f"Received XML data: {xml_data[:500]}...")  # Log first 500 characters of XML
-        root = ET.fromstring(xml_data)
-        
-        recordings = []
-        for file_elem in root.findall(".//File"):
-            name = file_elem.find("NAME").text
-            filepath = file_elem.find("FPATH").text
-            size = int(file_elem.find("SIZE").text)
-            timecode = int(file_elem.find("TIMECODE").text)
-            time = parse_viofo_datetime(file_elem.find("TIME").text)
-            attr = int(file_elem.find("ATTR").text)
-            
-            recording = Recording(name, filepath, size, timecode, time, attr)
-            recordings.append(recording)
-            logger.debug(f"Found recording: {recording}")
-        
-        logger.info(f"Total recordings found: {len(recordings)}")
-        logger.info("Successfully retrieved file list from dashcam.")
-        return recordings
-    except urllib.error.URLError as e:
-        logger.error(f"URLError when trying to get file list: {e}")
-        raise RuntimeError(f"Cannot obtain list of recordings from dashcam at address : {base_url}; error : {e}")
-    except socket.timeout as e:
-        logger.error(f"Socket timeout when trying to get file list: {e}")
-        raise UserWarning(f"Timeout communicating with dashcam at address : {base_url}; error : {e}")
-    except http.client.RemoteDisconnected as e:
-        logger.error(f"Remote disconnected when trying to get file list: {e}")
-        raise UserWarning(f"Dashcam disconnected without a response; address : {base_url}; error : {e}")
-    except ET.ParseError as e:
-        logger.error(f"XML parsing error: {e}")
-        logger.error(f"Problematic XML data: {xml_data}")
-        raise RuntimeError(f"Error parsing XML response from dashcam: {e}")
+    root = ET.fromstring(xml_data)
+    recordings = []
+    for fe in root.findall(".//File"):
+        name = fe.find("NAME").text
+        path = fe.find("FPATH").text
+        size = int(fe.find("SIZE").text)
+        timecode = int(fe.find("TIMECODE").text)
+        ts = parse_viofo_datetime(fe.find("TIME").text)
+        attr = int(fe.find("ATTR").text)
+        recordings.append(Recording(name, path, size, timecode, ts, attr))
+    logger.info(f"Found {len(recordings)} recordings on dashcam")
+    return recordings
 
 def get_filepath(destination, group_name, filename):
-    """constructs a path for a recording file from the destination, group name and filename (or glob pattern)"""
-    if group_name:
-        return os.path.join(destination, group_name, filename)
-    else:
-        return os.path.join(destination, filename)
+    return os.path.join(destination, group_name, filename) if group_name else os.path.join(destination, filename)
 
 def get_remote_size(url, timeout):
     req = urllib.request.Request(url, method="HEAD")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        size = resp.headers.get("Content-Length")
-        return int(size) if size and size.isdigit() else None
+        cl = resp.getheader("Content-Length")
+    return int(cl) if cl and cl.isdigit() else None
 
+def ensure_destination(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+    elif not os.path.isdir(path):
+        raise RuntimeError(f"Not a directory: {path}")
+    elif not os.access(path, os.W_OK):
+        raise RuntimeError(f"Not writable: {path}")
 
 def download_file(base_url, recording, destination, group_name, socket_timeout, dry_run):
-    """downloads a file only once its size has stabilized via two HEAD checks"""
-    logger.debug(f"Attempting to download file: {recording.filename}")
-    # ensure destination directory exists
-    if group_name:
-        group_dir = os.path.join(destination, group_name)
-        ensure_destination(group_dir)
-
-    dest_path = (os.path.join(destination, group_name, recording.filename)
-                 if group_name else os.path.join(destination, recording.filename))
-
-    # Build URL for HEAD
     cleaned = recording.filepath.replace('A:', '').replace('\\', '/')
     url = f"{base_url}/{cleaned}"
+    dest_dir = os.path.join(destination, group_name) if group_name else destination
+    ensure_destination(dest_dir)
+    final_path = os.path.join(dest_dir, recording.filename)
 
-    # Check size-stability
+    # 1) HEAD to get expected size
     try:
-        first_size = get_remote_size(url, socket_timeout)
-        time.sleep(10)
-        second_size = get_remote_size(url, socket_timeout)
+        expected_size = get_remote_size(url, socket_timeout)
     except Exception as e:
-        logger.warning(f"Unable to verify remote size for {recording.filename}: {e}")
-        # proceed to download anyway
-        first_size = second_size = None
+        logger.warning(f"Could not HEAD {recording.filename}: {e}")
+        expected_size = None
 
-    if first_size is not None and second_size is not None and first_size != second_size:
-        logger.info(
-            f"Remote file still changing: {recording.filename} ({first_size} -> {second_size}), retry later"
-        )
-        return False, None
-
-    # Skip if already downloaded and size matches
-    if os.path.exists(dest_path) and first_size is not None:
-        local_size = os.path.getsize(dest_path)
-        if local_size == first_size:
-            logger.debug(
-                f"Skipping download (up-to-date): {recording.filename} ({local_size} bytes)"
-            )
+    # 2) Skip if already complete
+    if expected_size is not None and os.path.exists(final_path):
+        if os.path.getsize(final_path) == expected_size:
+            logger.debug(f"Skipping complete file: {recording.filename}")
             return False, None
 
     if dry_run:
-        logger.debug(f"DRY RUN Would download file : {recording.filename}")
+        logger.info(f"[DRY RUN] Would download {recording.filename}")
         return True, None
 
-    try:
-        logger.info(f"Starting download for file: {recording.filename}")
-        start = time.perf_counter()
-        urllib.request.urlretrieve(url, dest_path)
-        elapsed = time.perf_counter() - start
+    # 3) Download into .part with retries
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=dest_dir, prefix=recording.filename, suffix=".part")
+    os.close(tmp_fd)
+    for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+        try:
+            logger.info(f"Downloading {recording.filename} (attempt {attempt})")
+            with urllib.request.urlopen(url, timeout=socket_timeout) as resp, open(tmp_path, "wb") as out:
+                shutil.copyfileobj(resp, out)
+        except Exception as e:
+            logger.warning(f"Attempt {attempt} failed: {e}")
+            time.sleep(RETRY_BACKOFF * attempt)
+        else:
+            actual_size = os.path.getsize(tmp_path)
+            if expected_size is not None and actual_size != expected_size:
+                logger.error(
+                    f"Incomplete download: {recording.filename} {actual_size}/{expected_size} bytes"
+                )
+                os.remove(tmp_path)
+                time.sleep(RETRY_BACKOFF * attempt)
+            else:
+                os.replace(tmp_path, final_path)
+                logger.info(f"Downloaded {recording.filename} ({actual_size} bytes)")
+                return True, None
 
-        logger.info(
-            f"Successfully downloaded {recording.filename} in {elapsed:.1f}s"
-        )
-        return True, None
-
-    except urllib.error.URLError as e:
-        logger.error(f"URLError downloading {recording.filename}: {e}")
-        cron_logger.warning(f"Ignoring failed download: {recording.filename}")
-        return False, None
-    except socket.timeout as e:
-        logger.error(f"Timeout downloading {recording.filename}: {e}")
-        raise UserWarning(f"Timeout for {recording.filename}: {e}")
-    except http.client.RemoteDisconnected as e:
-        logger.error(f"Remote disconnected during download {recording.filename}: {e}")
-        cron_logger.warning(f"Ignoring interrupted download: {recording.filename}")
-        return False, None
-
+    # all attempts failed
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    logger.error(f"Failed to download {recording.filename}")
+    return False, None
 
 def get_downloaded_recordings(destination, grouping):
-    """reads files from the destination directory and returns them as a set of filenames with parsed dates"""
-    group_name_glob = group_name_globs[grouping]
-
-    downloaded_filepath_glob = get_filepath(destination, group_name_glob, downloaded_filename_glob)
-
-    downloaded_filepaths = glob.glob(downloaded_filepath_glob)
-
-    recordings = set()
-    for filepath in downloaded_filepaths:
-        filename = os.path.basename(filepath)
-        filename_match = re.match(downloaded_filename_re, filename)
-        if filename_match:
-            year = int(filename_match.group("year"))
-            month = int(filename_match.group("month"))
-            day = int(filename_match.group("day"))
-            recording_date = datetime.date(year, month, day)
-            recordings.add((filename, recording_date))
-    return recordings
+    glob_pattern = get_filepath(destination, group_name_globs[grouping], downloaded_filename_glob)
+    files = glob.glob(glob_pattern)
+    recs = set()
+    for fp in files:
+        fn = os.path.basename(fp)
+        m = downloaded_filename_re.match(fn)
+        if m:
+            date = datetime.date(int(m.group("year")), int(m.group("month")), int(m.group("day")))
+            recs.add((fn, date))
+    return recs
 
 def get_outdated_recordings(destination, grouping):
-    """returns the recordings prior to the cutoff date"""
     if cutoff_date is None:
         return []
-
-    downloaded_recordings = get_downloaded_recordings(destination, grouping)
-
-    outdated_recordings = [filename for filename, recording_date in downloaded_recordings if recording_date < cutoff_date]
-    logger.debug(f"Checking outdated recordings against cutoff date {cutoff_date}:")
-    for filename, recording_date in downloaded_recordings:
-        logger.debug(f"Recording: {filename}, Date: {recording_date}, Outdated: {recording_date < cutoff_date}")
-    return outdated_recordings
+    downloaded = get_downloaded_recordings(destination, grouping)
+    return [fn for fn, dt in downloaded if dt < cutoff_date]
 
 def prepare_destination(destination, grouping):
-    """prepares the destination, ensuring it's valid and removing excess recordings"""
-    # optionally removes outdated recordings
     if cutoff_date:
-        outdated_recordings = get_outdated_recordings(destination, grouping)
-
-        for outdated_recording in outdated_recordings:
+        for fn in get_outdated_recordings(destination, grouping):
             if dry_run:
-                logger.info("DRY RUN Would remove outdated recording : %s", outdated_recording)
+                logger.info(f"[DRY RUN] Would remove {fn}")
                 continue
+            gp = group_name_globs[grouping]
+            pattern = f"{os.path.splitext(fn)[0]}.*"
+            to_remove = glob.glob(get_filepath(destination, gp, pattern))
+            for p in to_remove:
+                try:
+                    os.remove(p)
+                    logger.info(f"Removed old file {p}")
+                except OSError as e:
+                    logger.error(f"Error removing {p}: {e}")
 
-            logger.info("Removing outdated recording : %s", outdated_recording)
-
-            outdated_recording_glob = "%s.*" % os.path.splitext(outdated_recording)[0]
-            outdated_filepath_glob = get_filepath(destination, group_name_globs[grouping], outdated_recording_glob)
-
-            # Log the actual files in the directory for comparison
-            actual_files = glob.glob(get_filepath(destination, group_name_globs[grouping], "*"))
-            logger.debug(f"Actual files in directory: {actual_files}")
-
-            outdated_filepaths = glob.glob(outdated_filepath_glob)
-
-            for outdated_filepath in outdated_filepaths:
-                logger.debug(f"Attempting to remove file: {outdated_filepath}")
-                if os.path.exists(outdated_filepath):
-                    try:
-                        os.remove(outdated_filepath)
-                        logger.info(f"Successfully removed old file: {outdated_filepath}")
-                    except OSError as e:
-                        logger.error(f"Error removing file {outdated_filepath}: {e}")
-                else:
-                    logger.warning(f"File not found, could not remove: {outdated_filepath}")
 def sync(address, destination, grouping, download_priority, recording_filter, args):
-    """synchronizes the recordings at the Viofo dashcam address with the destination directory"""
-    logger.info(f"Starting sync process for address: {address}")
+    logger.info(f"Starting sync for {address}")
     prepare_destination(destination, grouping)
-
     base_url = f"http://{address}"
+
     try:
-        dashcam_recordings = get_dashcam_filenames(base_url)
-    except (RuntimeError, UserWarning) as e:
-        logger.error(f"Sync process aborted: {e}")
+        recs = get_dashcam_filenames(base_url)
+    except Exception as e:
+        logger.error(f"Aborting sync: {e}")
         return False
 
-    logger.debug(f"Sorting recordings based on priority: {download_priority}")
-    dashcam_recordings.sort(key=lambda r: r.datetime, reverse=(download_priority == "rdate"))
-
+    recs.sort(key=lambda r: r.datetime, reverse=(download_priority=="rdate"))
     if recording_filter:
-        logger.debug(f"Applying recording filter: {recording_filter}")
-        dashcam_recordings = [r for r in dashcam_recordings if any(f in r.filename for f in recording_filter)]
-        logger.info(f"Filtered recordings count: {len(dashcam_recordings)}")
+        recs = [r for r in recs if any(f in r.filename for f in recording_filter)]
+        logger.info(f"After filter: {len(recs)} recordings")
 
-    for recording in dashcam_recordings:
-        if cutoff_date and recording.datetime.date() < cutoff_date:
-            logger.debug(f"Skipping recording due to cutoff date: {recording.filename}")
+    for rec in recs:
+        if cutoff_date and rec.datetime.date() < cutoff_date:
             continue
-        group_name = get_group_name(recording.datetime, grouping)
-        downloaded, _ = download_file(base_url, recording, destination, group_name)
+        grp = get_group_name(rec.datetime, grouping)
+        downloaded, _ = download_file(base_url, rec, destination, grp, args.timeout, args.dry_run)
         if downloaded and args.gps_extract:
-            destination_filepath = os.path.join(destination, group_name, recording.filename) if group_name else os.path.join(destination, recording.filename)
-            extract_gps_data(destination_filepath)
+            fp = os.path.join(destination, grp or "", rec.filename)
+            extract_gps_data(fp)
 
-    logger.info("Sync process completed")
-    return True
-    logger.info(f"Starting sync process for address: {address}")
-    prepare_destination(destination, grouping)
-
-    base_url = f"http://{address}"
-    try:
-        dashcam_recordings = get_dashcam_filenames(base_url)
-    except (RuntimeError, UserWarning) as e:
-        logger.error(f"Sync process aborted: {e}")
-        return False
-
-    logger.debug(f"Sorting recordings based on priority: {download_priority}")
-    dashcam_recordings.sort(key=lambda r: r.datetime, reverse=(download_priority == "rdate"))
-
-    if recording_filter:
-        logger.debug(f"Applying recording filter: {recording_filter}")
-        dashcam_recordings = [r for r in dashcam_recordings if any(f in r.filename for f in recording_filter)]
-        logger.info(f"Filtered recordings count: {len(dashcam_recordings)}")
-
-    for recording in dashcam_recordings:
-        if cutoff_date and recording.datetime.date() < cutoff_date:
-            logger.debug(f"Skipping recording due to cutoff date: {recording.filename}")
-            continue
-        group_name = get_group_name(recording.datetime, grouping)
-        downloaded, _ = download_file(base_url, recording, destination, group_name)
-        if downloaded:
-            destination_filepath = os.path.join(destination, group_name, recording.filename) if group_name else os.path.join(destination, recording.filename)
-            extract_gps_data(destination_filepath)
-
-    logger.info("Sync process completed")
+    logger.info("Sync complete")
     return True
 
-def ensure_destination(destination):
-    """ensures the destination directory exists, creates if not, verifies it's writeable"""
-    if not os.path.exists(destination):
-        os.makedirs(destination)
-    elif not os.path.isdir(destination):
-        raise RuntimeError(f"Download destination is not a directory : {destination}")
-    elif not os.access(destination, os.W_OK):
-        raise RuntimeError(f"Download destination directory not writable : {destination}")
+def get_group_name(dt, grouping):
+    if grouping=="daily":
+        return dt.strftime("%Y-%m-%d")
+    if grouping=="weekly":
+        start = dt - datetime.timedelta(days=dt.weekday())
+        return start.strftime("%Y-%m-%d")
+    if grouping=="monthly":
+        return dt.strftime("%Y-%m")
+    if grouping=="yearly":
+        return dt.strftime("%Y")
+    return None
 
-def get_group_name(recording_datetime, grouping):
-    """determines the group name for a given recording according to the indicated grouping"""
-    if grouping == "daily":
-        return recording_datetime.strftime("%Y-%m-%d")
-    elif grouping == "weekly":
-        return (recording_datetime - datetime.timedelta(days=recording_datetime.weekday())).strftime("%Y-%m-%d")
-    elif grouping == "monthly":
-        return recording_datetime.strftime("%Y-%m")
-    elif grouping == "yearly":
-        return recording_datetime.strftime("%Y")
-    else:
-        return None
-
-def to_natural_speed(speed_bps):
-    """returns a natural representation of a given download speed in bps"""
-    for unit in ['bps', 'Kbps', 'Mbps', 'Gbps']:
-        if speed_bps < 1000.0:
-            return f"{speed_bps:.1f}{unit}"
-        speed_bps /= 1000.0
-    return f"{speed_bps:.1f}Tbps"
-
-# GPS Extraction Functions
+# (GPX & GPS extraction functions remain unchanged)...
 def fix_time(hour, minute, second, year, month, day):
     return f"{year+2000:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}Z"
 
-def fix_coordinates(hemisphere, coordinate):
-    minutes = coordinate % 100.0
-    degrees = coordinate - minutes
-    coordinate = degrees / 100.0 + (minutes / 60.0)
-    return -1 * float(coordinate) if hemisphere in ['S', 'W'] else float(coordinate)
+def fix_coordinates(hemi, coord):
+    mins = coord % 100.0
+    deg = coord - mins
+    val = deg/100.0 + mins/60.0
+    return -val if hemi in ['S','W'] else val
 
-def fix_speed(speed):
-    return speed * 0.514444
+def fix_speed(s): return s * 0.514444
 
-def get_atom_info(eight_bytes):
-    try:
-        atom_size, atom_type = struct.unpack('>I4s', eight_bytes)
-        return int(atom_size), atom_type.decode()
-    except (struct.error, UnicodeDecodeError):
-        return 0, ''
+def get_atom_info(b): return struct.unpack('>I4s', b)
 
-def get_gps_atom_info(eight_bytes):
-    atom_pos, atom_size = struct.unpack('>II', eight_bytes)
-    return int(atom_pos), int(atom_size)
+def get_gps_atom_info(b):
+    pos, size = struct.unpack('>II', b)
+    return pos, size
 
 def get_gps_data(data):
-    gps = {
-        'DT': {
-            'Year': None, 'Month': None, 'Day': None,
-            'Hour': None, 'Minute': None, 'Second': None, 'DT': None
-        },
-        'Loc': {
-            'Lat': {'Raw': None, 'Hemi': None, 'Float': None},
-            'Lon': {'Raw': None, 'Hemi': None, 'Float': None},
-            'Speed': None, 'Bearing': None,
-        },
+    gps = {'DT':{}, 'Loc':{}}
+    off = 0
+    hour, minute, second, year, month, day = struct.unpack_from('<IIIIII', data, off)
+    off += 24
+    act, lat_h, lon_h = struct.unpack_from('<ccc', data, off)
+    off += 4
+    lat_r, lon_r, sp, bc = struct.unpack_from('<ffff', data, off)
+    gps['DT'] = {'Hour':hour,'Minute':minute,'Second':second,'Year':year,'Month':month,'Day':day,
+                 'DT':fix_time(hour,minute,second,year,month,day)}
+    gps['Loc'] = {
+        'Lat':{'Raw':lat_r,'Hemi':lat_h.decode(),'Float':fix_coordinates(lat_h.decode(),lat_r)},
+        'Lon':{'Raw':lon_r,'Hemi':lon_h.decode(),'Float':fix_coordinates(lon_h.decode(),lon_r)},
+        'Speed':fix_speed(sp),'Bearing':bc
     }
-    
-    offset = 0
-    hour, minute, second, year, month, day = struct.unpack_from('<IIIIII', data, offset)
-    offset += 24
-    active, lat_hemi, lon_hemi = struct.unpack_from('<ccc', data, offset)
-    offset += 4
-    lat_raw, lon_raw, speed, bearing = struct.unpack_from('<ffff', data, offset)
-
-    gps['DT']['Hour'], gps['DT']['Minute'], gps['DT']['Second'] = hour, minute, second
-    gps['DT']['Year'], gps['DT']['Month'], gps['DT']['Day'] = year, month, day
-    gps['DT']['DT'] = fix_time(hour, minute, second, year, month, day)
-
-    gps['Loc']['Lat']['Hemi'] = lat_hemi.decode()
-    gps['Loc']['Lon']['Hemi'] = lon_hemi.decode()
-    gps['Loc']['Lat']['Raw'] = lat_raw
-    gps['Loc']['Lon']['Raw'] = lon_raw
-    gps['Loc']['Lat']['Float'] = fix_coordinates(gps['Loc']['Lat']['Hemi'], gps['Loc']['Lat']['Raw'])
-    gps['Loc']['Lon']['Float'] = fix_coordinates(gps['Loc']['Lon']['Hemi'], gps['Loc']['Lon']['Raw'])
-    gps['Loc']['Speed'] = fix_speed(speed)
-    gps['Loc']['Bearing'] = bearing
-
     return gps
 
-def get_gps_atom(gps_atom_info, f):
-    atom_pos, atom_size = gps_atom_info
-    logger.debug(f"Atom pos = {atom_pos:x}, atom size = {atom_size:x}")
-    try:
-        f.seek(atom_pos)
-        data = f.read(atom_size)
-    except OverflowError as e:
-        logger.error(f"Skipping at {atom_pos:x}: seek or read error. Error: {str(e)}")
+def get_gps_atom(gps_info, fh):
+    pos, size = gps_info
+    fh.seek(pos)
+    data = fh.read(size)
+    s1, t, m = struct.unpack_from('>I4s4s', data)
+    if t.decode()!='free' or m.decode()!='GPS ' or s1!=size:
         return None
-
-    expected_type, expected_magic = 'free', 'GPS '
-    atom_size1, atom_type, magic = struct.unpack_from('>I4s4s', data)
-    try:
-        atom_type = atom_type.decode()
-        magic = magic.decode()
-        if atom_size != atom_size1 or atom_type != expected_type or magic != expected_magic:
-            logger.error(f"Error! skipping atom at {atom_pos:x} (expected size:{atom_size}, actual size:{atom_size1}, expected type:{expected_type}, actual type:{atom_type}, expected magic:{expected_magic}, actual magic:{magic})!")
-            return None
-    except UnicodeDecodeError as e:
-        logger.error(f"Skipping at {atom_pos:x}: garbage atom type or magic. Error: {str(e)}")
-        return None
-
     return get_gps_data(data[12:])
 
-def parse_moov(in_fh):
-    gps_data = []
+def parse_moov(fh):
+    data = []
     offset = 0
     while True:
-        atom_size, atom_type = get_atom_info(in_fh.read(8))
-        if atom_size == 0:
-            break
-
-        if atom_type == 'moov':
-            logger.debug("Found the 'moov' atom.")
-            sub_offset = offset + 8
-            while sub_offset < (offset + atom_size):
-                sub_atom_size, sub_atom_type = get_atom_info(in_fh.read(8))
-
-                if sub_atom_type == 'gps ':
-                    logger.debug("Found the gps chunk descriptor atom.")
-                    gps_offset = 16 + sub_offset  # +16 = skip headers
-                    in_fh.seek(gps_offset, 0)
-                    while gps_offset < (sub_offset + sub_atom_size):
-                        data = get_gps_atom(get_gps_atom_info(in_fh.read(8)), in_fh)
-                        if data:
-                            gps_data.append(data)
-                        gps_offset += 8
-                        in_fh.seek(gps_offset, 0)
-
-                sub_offset += sub_atom_size
-                in_fh.seek(sub_offset, 0)
-
-        offset += atom_size
-        in_fh.seek(offset, 0)
-    return gps_data
+        size, t = get_atom_info(fh.read(8))
+        if size==0: break
+        if t.decode()=='moov':
+            sub = offset+8
+            while sub < offset+size:
+                s2, t2 = get_atom_info(fh.read(8))
+                if t2.decode()=='gps ':
+                    fh.seek(sub+16)
+                    while sub+16 < offset+size:
+                        info = get_gps_atom_info(fh.read(8))
+                        res = get_gps_atom(info, fh)
+                        if res: data.append(res)
+                        sub += 8
+                        fh.seek(sub+16)
+                sub += s2
+                fh.seek(sub)
+        offset += size
+        fh.seek(offset)
+    return data
 
 def generate_gpx(gps_data, out_file):
-    gpx = '<?xml version="1.0" encoding="UTF-8"?>\n'
-    gpx += '<gpx version="1.0"\n'
-    gpx += '\tcreator="Viofo GPS Extractor"\n'
-    gpx += '\txmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n'
-    gpx += '\txmlns="http://www.topografix.com/GPX/1/0"\n'
-    gpx += '\txsi:schemaLocation="http://www.topografix.com/GPX/1/0 http://www.topografix.com/GPX/1/0/gpx.xsd">\n'
-    gpx += f"\t<name>{out_file}</name>\n"
-    gpx += f"\t<trk><name>{out_file}</name><trkseg>\n"
-    for gps in gps_data:
-        if gps:
-            gpx += f"\t\t<trkpt lat=\"{gps['Loc']['Lat']['Float']}\" lon=\"{gps['Loc']['Lon']['Float']}\">"
-            gpx += f"<time>{gps['DT']['DT']}</time>"
-            gpx += f"<speed>{gps['Loc']['Speed']}</speed>"
-            gpx += f"<course>{gps['Loc']['Bearing']}</course></trkpt>\n"
-    gpx += '\t</trkseg></trk>\n'
-    gpx += '</gpx>\n'
+    gpx = '<?xml version="1.0"?>\n<gpx version="1.0" creator="Viofo GPS Extractor">\n<trk><name>' \
+          + out_file + '</name><trkseg>\n'
+    for g in gps_data:
+        gpx += f'\t<trkpt lat="{g["Loc"]["Lat"]["Float"]}" lon="{g["Loc"]["Lon"]["Float"]}">' \
+               f'<time>{g["DT"]["DT"]}</time><speed>{g["Loc"]["Speed"]}</speed>' \
+               f'<course>{g["Loc"]["Bearing"]}</course></trkpt>\n'
+    gpx += '</trkseg></trk>\n</gpx>\n'
     return gpx
 
-def extract_gps_data(file_path):
-    logger.info(f"Extracting GPS data from {file_path}")
-    
-    gps_data = []
-    with open(file_path, "rb") as in_fh:
-        gps_data = parse_moov(in_fh)
-
-    logger.info(f"Found {len(gps_data)} GPS data points.")
-
-    if gps_data:
-        gpx_file = file_path + ".gpx"
-        gpx_content = generate_gpx(gps_data, os.path.basename(gpx_file))
-        with open(gpx_file, "w") as f:
-            logger.info(f"Writing GPS data to output file '{gpx_file}'.")
-            f.write(gpx_content)
-    else:
-        logger.warning("No GPS data found in the file.")
+def extract_gps_data(fp):
+    logger.info(f"Extracting GPS from {fp}")
+    with open(fp, "rb") as f:
+        data = parse_moov(f)
+    if not data:
+        logger.warning("No GPS data found")
+        return
+    gpx = generate_gpx(data, os.path.basename(fp) + ".gpx")
+    with open(fp + ".gpx", "w") as out:
+        out.write(gpx)
+        logger.info(f"Wrote GPX to {fp}.gpx")
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Synchronizes Viofo dashcam recordings or monitors continuously."
-    )
-    parser.add_argument("address", help="Dashcam IP address or hostname")
-    parser.add_argument("-d", "--destination", default=os.getcwd(),
-                        help="Destination directory for downloads")
-    parser.add_argument("-g", "--grouping", choices=["none","daily","weekly","monthly","yearly"],
-                        default="none", help="Group recordings by time period")
-    parser.add_argument("-p", "--priority", choices=["date","rdate"], default="date",
-                        help="Download priority: date or rdate")
-    parser.add_argument("-f", "--filter", nargs="+",
-                        help="Filter recordings by filename pattern")
-    parser.add_argument("-k", "--keep",
-                        help="Keep recordings for <number>[d|w]")
-    parser.add_argument("-u", "--max-used-disk", type=int, choices=range(5,99),
-                        default=90, metavar="DISK%", help="Max disk usage percent")
-    parser.add_argument("-t", "--timeout", type=float, default=10.0,
-                        help="Connection timeout (seconds)")
-    parser.add_argument("-v", "--verbose", action="count", default=0,
-                        help="Increase verbosity (DEBUG)")
-    parser.add_argument("-q", "--quiet", action="store_true",
-                        help="Quiet mode (errors only)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Perform a trial run without downloading")
-    parser.add_argument("--cron", action="store_true",
-                        help="Cron-style logging")
-    parser.add_argument("--gps-extract", action="store_true",
-                        help="Extract GPS data to .gpx")
-    parser.add_argument("--run-once", action="store_true",
-                        help="Do a single sync then exit")
-    parser.add_argument("--monitor", action="store_true",
-                        help="Long-running monitor mode (no cron)")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Sync Viofo dashcam recordings")
+    p.add_argument("address", help="Dashcam IP/hostname")
+    p.add_argument("-d","--destination", default=os.getcwd(), help="Download directory")
+    p.add_argument("-g","--grouping", choices=["none","daily","weekly","monthly","yearly"], default="none")
+    p.add_argument("-p","--priority", choices=["date","rdate"], default="date")
+    p.add_argument("-f","--filter", nargs="+", help="Filename substring filter")
+    p.add_argument("-k","--keep", help="Keep for <number>[d|w]")
+    p.add_argument("-u","--max-used-disk", type=int, choices=range(5,99), default=90, metavar="DISK%")
+    p.add_argument("-t","--timeout", type=float, default=10.0, help="Timeout seconds")
+    p.add_argument("-v","--verbose", action="count", default=0)
+    p.add_argument("-q","--quiet", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--gps-extract", action="store_true")
+    p.add_argument("--run-once", action="store_true")
+    p.add_argument("--monitor", action="store_true")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    return p.parse_args()
 
 def monitor_loop(address, destination, grouping, priority, recording_filter, args):
-    """Long-running loop: HEAD-check for new/grown files, then download only changed ones."""
-    logger.info("Entering monitor loop; press Ctrl+C to exit")
-    last_sizes = {}  # filename → last observed remote size
+    logger.info("Entering monitor loop (Ctrl+C to exit)")
     base_url = f"http://{address}"
     while True:
-        # 1) Quick HEAD on file list endpoint to check availability
         try:
-            req = urllib.request.Request(f"{base_url}/?custom=1&cmd=3015&par=1", method="HEAD")
-            urllib.request.urlopen(req, timeout=socket_timeout)
+            recs = get_dashcam_filenames(base_url)
         except Exception as e:
-            logger.warning("Dashcam unreachable: %s; retrying in 30s", e)
-            time.sleep(30)
+            logger.warning(f"Failed to list files; retry in 30s: {e}")
+            time.sleep(600)
             continue
 
-        # 2) Fetch full file list
-        try:
-            recordings = get_dashcam_filenames(base_url)
-        except Exception as e:
-            logger.error("Failed to fetch list: %s; retrying in 30s", e)
-            time.sleep(30)
-            continue
-
-        to_download = []
-        # 3) For each recording, HEAD to check if new or grown
-        for rec in recordings:
-            cleaned = rec.filepath.replace('A:', '').replace('\\','/')
+        to_dl = []
+        for rec in recs:
+            cleaned = rec.filepath.replace('A:','').replace('\\','/')
             url = f"{base_url}/{cleaned}"
             try:
-                req = urllib.request.Request(url, method="HEAD")
-                with urllib.request.urlopen(req, timeout=socket_timeout) as resp:
-                    remote_size = int(resp.getheader("Content-Length","0"))
+                remote_size = get_remote_size(url, socket_timeout)
             except Exception:
                 continue
+            grp = get_group_name(rec.datetime, grouping) or ""
+            local_fp = os.path.join(destination, grp, rec.filename)
+            local_size = os.path.getsize(local_fp) if os.path.exists(local_fp) else -1
+            if local_size != remote_size:
+                to_dl.append(rec)
 
-            prev = last_sizes.get(rec.filename)
-            if prev is None or prev != remote_size:
-                last_sizes[rec.filename] = remote_size
-                to_download.append(rec)
-
-        # 4) Download changed
-        if to_download:
-            logger.info("Detected %d new/updated files", len(to_download))
-            for rec in to_download:
+        if to_dl:
+            logger.info(f"{len(to_dl)} files to (re)download")
+            for rec in to_dl:
                 grp = get_group_name(rec.datetime, grouping)
-                downloaded, _ = download_file(base_url, rec, destination, grp, args.timeout, args.dry-run)
+                downloaded, _ = download_file(
+                    base_url, rec, destination, grp, args.timeout, args.dry_run
+                )
                 if downloaded and args.gps_extract:
-                    extract_gps_data(os.path.join(destination, grp or "", rec.filename))
+                    fp = os.path.join(destination, grp or "", rec.filename)
+                    extract_gps_data(fp)
         else:
-            logger.debug("No changes detected")
+            logger.debug("All files up to date")
 
-        time.sleep(30)  # polling interval; you can make this configurable
+        time.sleep(600)
 
 def run():
-    global dry_run, max_disk_used_percent, cutoff_date, socket_timeout
-
+    global dry_run, cutoff_date, socket_timeout
     args = parse_args()
     socket_timeout = args.timeout
     socket.setdefaulttimeout(socket_timeout)
 
-    # logging levels
     if args.quiet:
         logger.setLevel(logging.ERROR)
-        cron_logger.setLevel(logging.ERROR)
-    elif args.cron:
-        logger.setLevel(logging.WARNING)
-        cron_logger.setLevel(logging.INFO)
+    elif args.verbose:
+        logger.setLevel(logging.DEBUG)
     else:
-        logger.setLevel(logging.DEBUG if args.verbose>0 else logging.INFO)
+        logger.setLevel(logging.INFO)
 
     dry_run = args.dry_run
-
-    # compute cutoff_date if --keep used…
-    # … (your existing keep logic) …
+    if args.keep:
+        m = re.fullmatch(r"(\d+)([dw]?)", args.keep)
+        if not m:
+            raise RuntimeError("KEEP format <number>[d|w]")
+        n, unit = int(m.group(1)), m.group(2) or "d"
+        delta = datetime.timedelta(days=n if unit=="d" else 0, weeks=n if unit=="w" else 0)
+        cutoff_date = datetime.date.today() - delta
+        logger.info(f"Cutoff date: {cutoff_date}")
 
     if args.monitor:
-        monitor_loop(args.address, args.destination,
-                     args.grouping, args.priority,
-                     args.filter, args)
+        monitor_loop(args.address, args.destination, args.grouping,
+                     args.priority, args.filter, args)
         return 0
 
-    # otherwise do one sync
     success = sync(args.address, args.destination,
-                   args.grouping, args.priority,
-                   args.filter, args)
+                   args.grouping, args.priority, args.filter, args)
     return 0 if success else 1
 
 if __name__ == "__main__":

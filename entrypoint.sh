@@ -12,9 +12,8 @@ CMD=( python3 /viofosync.py
 
 # Map booleans
 [ -n "$DRY_RUN"    ] && CMD+=( --dry-run )
-[ -n "$GPS_EXTRACT"] && CMD+=( --gps-extract )
+[ -n "$GPS_EXTRACT" ] && CMD+=( --gps-extract )
 [ -n "$QUIET"      ] && CMD+=( --quiet )
-[ -n "$CRON"       ] && CMD+=( --cron )
 
 # Verbosity
 [ "$VERBOSE" -gt 0 ] && for i in $(seq 1 $VERBOSE); do CMD+=( --verbose ); done
