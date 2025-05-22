@@ -440,14 +440,15 @@ def parse_args():
 
 
 def monitor_loop(address, destination, grouping, priority, recording_filter, args):
+    sleep_time_s = 600
     logger.info("Entering monitor loop (Ctrl+C to exit)")
     base_url = f"http://{address}"
     while True:
         try:
             recs = get_dashcam_filenames(base_url)
         except Exception as e:
-            logger.warning(f"Failed to list files; retry in 30s: {e}")
-            time.sleep(600)
+            logger.warning(f"Failed to list files; retry in {sleep_time_s}s: {e}")
+            time.sleep(sleep_time_s)
             continue
 
         to_dl = []
@@ -478,7 +479,7 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
         else:
             logger.debug("All files up to date")
 
-        time.sleep(600)
+        time.sleep(sleep_time_s)
 
 
 def run():
