@@ -133,26 +133,19 @@ def ensure_destination(path):
     elif not os.access(path, os.W_OK):
         raise RuntimeError(f"Not writable: {path}")
 
-def is_camera_online(list_url, timeout, sleep_time_s):
-    """
-    Returns True if the camera responds to a HEAD at list_url.
-    If it’s unreachable or times out, logs & sleeps, then returns False.
-    """
+def is_camera_online(list_url, timeout):
     try:
         req = urllib.request.Request(list_url, method="HEAD")
         urllib.request.urlopen(req, timeout=timeout)
         return True
     except URLError as e:
-        # e.reason is often an OSError for socket‐level failures
         err = e.reason
         if isinstance(err, OSError) and err.errno == errno.EHOSTUNREACH:
-            logger.warning(f"Camera offline (host unreachable); retrying in {sleep_time_s}s")
+            logger.warning("Camera offline (host unreachable)")
         else:
-            logger.warning(f"Cannot reach camera ({err}); retrying in {sleep_time_s}s")
+            logger.warning(f"Cannot reach camera ({err})")
     except socket.timeout:
-        logger.warning(f"Camera timed out; retrying in {sleep_time_s}s")
-
-    time.sleep(sleep_time_s)
+        logger.warning("Camera timed out")
     return False
 
 def human_size_and_speed(num_bytes: int, elapsed: float):
@@ -514,7 +507,7 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
     logger.info("Entering monitor loop (Ctrl+C to exit)")
     while True:
         # 1) Connectivity check
-        if not is_camera_online(list_url, socket_timeout, sleep_time_s):
+        if not is_camera_online(list_url, socket_timeout):
             continue
 
         # 2) Fetch & filter list
@@ -537,13 +530,13 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
                 continue
 
             cleaned = rec.filepath.replace('A:', '').replace('\\','/')
-            url     = f"{base_url}/{cleaned}"
+            url = f"{base_url}/{cleaned}"
             try:
                 remote_size = get_remote_size(url, socket_timeout)
             except Exception:
                 continue
 
-            grp      = get_group_name(rec.datetime, grouping) or ""
+            grp = get_group_name(rec.datetime, grouping) or ""
             local_fp = os.path.join(destination, grp, rec.filename)
             local_size = os.path.getsize(local_fp) if os.path.exists(local_fp) else -1
 
@@ -555,8 +548,9 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
             total = len(to_dl)
             logger.info(f"{total} files to (re)download")
             for i, rec in enumerate(to_dl, start=1):
-                # before each download you can bail if offline…
-                if not is_camera_online(list_url, socket_timeout, sleep_time_s):
+                # check *again* before each file
+                if not is_camera_online(list_url, socket_timeout):
+                    logger.info(f"Lost camera mid‐batch; aborting downloads and retrying in {sleep_time_s}s")
                     break
 
                 logger.info(f"[{i}/{total}] Downloading {rec.filename}")
