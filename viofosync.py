@@ -21,6 +21,7 @@ __version__ = "1.1"
 
 import argparse
 import datetime
+import errno
 from collections import namedtuple
 import glob
 import http.client
@@ -29,12 +30,13 @@ import re
 import os
 import time
 import urllib.request
-import urllib.error
 import socket
 import xml.etree.ElementTree as ET
 import struct
 import shutil
 import tempfile
+
+from urllib.error import URLError
 
 # Constants
 dry_run = False
@@ -490,35 +492,88 @@ def parse_args():
 
 def monitor_loop(address, destination, grouping, priority, recording_filter, args):
     sleep_time_s = 600
-    logger.info("Entering monitor loop (Ctrl+C to exit)")
     base_url = f"http://{address}"
+    list_url = f"{base_url}/?custom=1&cmd=3015&par=1"
+
+    logger.info("Entering monitor loop (Ctrl+C to exit)")
     while True:
+        # ────────────────────────────────────────
+        # 1) Quick connectivity check
         try:
-            recs = get_dashcam_filenames(base_url)
+            req = urllib.request.Request(list_url, method="HEAD")
+            urllib.request.urlopen(req, timeout=socket_timeout)
         except Exception as e:
-            logger.warning(f"Failed to list files; retry in {sleep_time_s}s: {e}")
+            logger.warning(f"Dashcam offline or unreachable: {e}; retrying in {sleep_time_s}s")
             time.sleep(sleep_time_s)
             continue
 
+        # ────────────────────────────────────────
+        # 2) Fetch the full file list
+        try:
+            recs = get_dashcam_filenames(base_url)
+        except Exception as e:
+            logger.warning(f"Failed to fetch file list: {e}; retrying in {sleep_time_s}s")
+            time.sleep(sleep_time_s)
+            continue
+
+        # ────────────────────────────────────────
+        # 3) Sort & filter exactly as in sync()
+        recs.sort(key=lambda r: r.datetime, reverse=(priority=="rdate"))
+        if recording_filter:
+            recs = [r for r in recs if any(f in r.filename for f in recording_filter)]
+            logger.info(f"After filter: {len(recs)} recordings")
+
+        # ────────────────────────────────────────
+        # 4) Head-compare each file to on-disk before deciding to download
         to_dl = []
         for rec in recs:
+            if cutoff_date and rec.datetime.date() < cutoff_date:
+                continue
+
+            grp = get_group_name(rec.datetime, grouping)
+            local_dir = os.path.join(destination, grp) if grp else destination
+            local_fp  = os.path.join(local_dir, rec.filename)
+
             cleaned = rec.filepath.replace('A:', '').replace('\\', '/')
-            url = f"{base_url}/{cleaned}"
+            url     = f"{base_url}/{cleaned}"
+
             try:
                 remote_size = get_remote_size(url, socket_timeout)
             except Exception:
+                # if we can’t HEAD this particular file, skip it for now
                 continue
 
-            grp = get_group_name(rec.datetime, grouping) or ""
-            local_fp = os.path.join(destination, grp, rec.filename)
             local_size = os.path.getsize(local_fp) if os.path.exists(local_fp) else -1
             if local_size != remote_size:
                 to_dl.append(rec)
 
+        # ────────────────────────────────────────
+        # 5) Download anything new/changed
         if to_dl:
             logger.info(f"{len(to_dl)} files to (re)download")
             for rec in to_dl:
-                grp = get_group_name(rec.datetime, grouping)
+                # —— abort if camera just went offline ——
+                try:
+                    # quick HEAD on the list endpoint
+                    req = urllib.request.Request(list_url, method="HEAD")
+                    urllib.request.urlopen(req, timeout=socket_timeout)
+                except URLError as e:
+                    # e.reason is often an OSError for socket-level failures
+                    if isinstance(e.reason, OSError) and e.reason.errno == errno.EHOSTUNREACH:
+                        logger.warning(
+                            f"Camera offline (host unreachable); retrying in {sleep_time_s}s"
+                        )
+                        break  # abort current download batch
+                    else:
+                        # some other URLError (DNS failure, etc.)—treat as offline, too
+                        logger.warning(f"Cannot reach camera: {e.reason}; retrying in {sleep_time_s}s")
+                        break
+                except socket.timeout:
+                    logger.warning(f"Camera timed out; retrying in {sleep_time_s}s")
+                    break
+
+                # otherwise proceed with normal .part-file logic
+                grp, cleaned = get_group_name(rec.datetime, grouping), rec.filepath.replace('A:', '').replace('\\', '/')
                 downloaded, _ = download_file(
                     base_url, rec, destination, grp, args.timeout, args.dry_run
                 )
@@ -528,7 +583,9 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
         else:
             logger.debug("All files up to date")
 
+        # ────────────────────────────────────────
         time.sleep(sleep_time_s)
+
 
 
 def run():
