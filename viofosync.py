@@ -563,7 +563,8 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
                 if downloaded and args.gps_extract:
                     fp = os.path.join(destination, grp or "", rec.filename)
                     extract_gps_data(fp)
-            logger.info(f"All current files downloaded, sleeping for {sleep_time_s}s")
+                if i == total:
+                    logger.info(f"All current files downloaded, sleeping for {sleep_time_s}s")
 
         else:
             logger.debug("All files up to date")
