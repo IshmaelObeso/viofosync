@@ -317,8 +317,16 @@ def fix_coordinates(hemi, coord):
 def fix_speed(s): return s * 0.514444
 
 
-def get_atom_info(b): return struct.unpack('>I4s', b)
-
+def get_atom_info(b):
+    # if we didn’t get 8 bytes, that means EOF or malformed atom → stop parsing
+    if len(b) < 8:
+        return 0, ''
+    size, raw_type = struct.unpack('>I4s', b)
+    try:
+        atom_type = raw_type.decode('utf-8')
+    except UnicodeDecodeError:
+        atom_type = ''
+    return size, atom_type
 
 def get_gps_atom_info(b):
     pos, size = struct.unpack('>II', b)
