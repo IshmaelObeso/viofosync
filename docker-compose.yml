@@ -1,6 +1,6 @@
 services:
   viofosync:
-    image: robxyz/viofosync
+    image: toodamnfresh/viofosync
     container_name: viofosync
     restart: unless-stopped
 
