@@ -300,8 +300,8 @@ def sync(address, destination, grouping, download_priority, recording_filter, ar
         recs = [r for r in recs if any(f in r.filename for f in recording_filter)]
         logger.info(f"After filter: {len(recs)} recordings")
 
-    for rec in recs:
-        # skip old
+    total = len(recs)
+    for i, rec in enumerate(recs, start=1):
         if cutoff_date and rec.datetime.date() < cutoff_date:
             continue
 
@@ -327,17 +327,12 @@ def sync(address, destination, grouping, download_priority, recording_filter, ar
                 logger.debug(f"Skipping unchanged file: {rec.filename} ({size_str})")
                 continue
 
-        # otherwise download (honors .part logic)
+        # only log the counter when you actually attempt to download
+        logger.info(f"[{i}/{total}] Attempting download of {rec.filename}")
         downloaded, _ = download_file(
-            base_url,
-            rec,
-            destination,
-            grp,
-            args.timeout,
-            args.dry_run
+            base_url, rec, destination, grp,
+            args.timeout, args.dry_run
         )
-
-        # post‐download GPS extract
         if downloaded and args.gps_extract:
             extract_gps_data(local_path)
 
@@ -557,13 +552,14 @@ def monitor_loop(address, destination, grouping, priority, recording_filter, arg
 
         # 4) Download changed files, but bail if offline
         if to_dl:
-            logger.info(f"{len(to_dl)} files to (re)download")
-            for rec in to_dl:
+            total = len(to_dl)
+            logger.info(f"{total} files to (re)download")
+            for i, rec in enumerate(to_dl, start=1):
+                # before each download you can bail if offline…
                 if not is_camera_online(list_url, socket_timeout, sleep_time_s):
-                    # camera went offline, restart loop
                     break
 
-                grp = get_group_name(rec.datetime, grouping)
+                logger.info(f"[{i}/{total}] Downloading {rec.filename}")
                 downloaded, _ = download_file(
                     base_url, rec, destination, grp,
                     args.timeout, args.dry_run
